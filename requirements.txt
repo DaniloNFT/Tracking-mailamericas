@@ -1,0 +1,8 @@
+undetected-chromedriver==3.5.5
+selenium>=4.21.0
+gspread>=6.1.0
+oauth2client>=4.1.3
+python-dotenv>=1.0.1
+pytz>=2024.1
+requests>=2.32.3
+beautifulsoup4>=4.12.3
