@@ -1,3 +1,4 @@
+# tracking.py — listo para GitHub Actions (sin archivo .json)
 import os, sys, re, json, pytz, time, warnings
 from datetime import datetime
 from dotenv import load_dotenv
@@ -6,7 +7,7 @@ from dotenv import load_dotenv
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# Selenium (estándar, sin undetected)
+# Selenium estándar (Selenium Manager)
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.common.by import By
@@ -14,63 +15,73 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
-load_dotenv()
+load_dotenv()  # permite usar .env en local; en Actions vienen de secrets
 
-# ===== Config =====
+# ===== Config (todo desde ENV/Secrets) =====
 SHEET_ID         = os.getenv("SHEET_ID")
 TAB_TRACKING     = os.getenv("TAB_TRACKING", "Tracking")
+
+# Headless por defecto en CI (puedes poner false en local si quieres ver la ventana)
 RUN_HEADLESS     = (os.getenv("RUN_HEADLESS", "true").strip().lower() in {"1","true","yes","y"})
 PAGELOAD_TIMEOUT = int(os.getenv("PAGELOAD_TIMEOUT", "25"))
 IMPLICIT_WAIT    = int(os.getenv("IMPLICIT_WAIT", "10"))
-CHROME_BINARY    = (os.getenv("CHROME_BINARY") or "").strip()  # opcional
+
+# Si en el workflow instalas Chrome, pasa su ruta en CHROME_BINARY
+CHROME_BINARY    = (os.getenv("CHROME_BINARY") or "").strip()
 
 LA_PAZ = pytz.timezone("America/La_Paz")
 
-# Mapeo de columnas (1-based en Google Sheets)
-COL_CONTENT = 1  # A: Contenido del paquete (manual)
-COL_CODE    = 2  # B: Código de rastreo
-COL_STATUS  = 3  # C: Último estado (auto)
-COL_DATE    = 4  # D: Fecha del estado (auto)
-COL_CARRIER = 5  # E: Carrier / Ubicación (auto)
-COL_UPDATED = 6  # F: Última actualización (auto)
-COL_OBS     = 7  # G: Observación (auto)
-COL_DONE    = 8  # H: Control ("OK" = omitir fila)
+# Mapeo columnas (A..H) — 1-based
+COL_CONTENT = 1  # A: Contenido (manual)
+COL_CODE    = 2  # B: Código
+COL_STATUS  = 3  # C: Último estado
+COL_DATE    = 4  # D: Fecha del estado
+COL_CARRIER = 5  # E: Carrier / Ubicación
+COL_UPDATED = 6  # F: Última actualización
+COL_OBS     = 7  # G: Observación
+COL_DONE    = 8  # H: Control ("OK" = omitir)
 
 def now_bo():
     return datetime.now(LA_PAZ).strftime("%Y-%m-%d %H:%M:%S %z")
 
 def creds_from_env():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+    """
+    Prioriza GOOGLE_SERVICE_ACCOUNT_JSON (contenido del JSON como string, desde secrets).
+    Si no existe, intenta GOOGLE_APPLICATION_CREDENTIALS (ruta a archivo).
+    """
+    scopes = ["https://www.googleapis.com/auth/spreadsheets",
+              "https://www.googleapis.com/auth/drive"]
     json_inline = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
     file_path   = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
+
     if json_inline:
         data = json.loads(json_inline)
         return ServiceAccountCredentials.from_json_keyfile_dict(data, scopes=scopes)
     if file_path:
         return ServiceAccountCredentials.from_json_keyfile_name(file_path, scopes=scopes)
-    raise RuntimeError("Faltan credenciales")
+    raise RuntimeError("Faltan credenciales: define GOOGLE_SERVICE_ACCOUNT_JSON o GOOGLE_APPLICATION_CREDENTIALS")
 
 def open_ws():
     if not SHEET_ID:
-        print("SHEET_ID no definido en .env", file=sys.stderr); sys.exit(2)
+        print("SHEET_ID no definido", file=sys.stderr); sys.exit(2)
     gc = gspread.authorize(creds_from_env())
     return gc.open_by_key(SHEET_ID).worksheet(TAB_TRACKING)
 
 def build_driver():
     opts = ChromeOptions()
     if RUN_HEADLESS:
-        # probar headless normal en lugar de new
+        # usa headless clásico por máxima compatibilidad en CI
         opts.add_argument("--headless")
         opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1280,2000")
     opts.add_argument("--no-first-run")
     opts.add_argument("--no-default-browser-check")
     opts.add_argument("--disable-background-networking")
     if CHROME_BINARY:
         opts.binary_location = CHROME_BINARY
+
     d = webdriver.Chrome(options=opts)  # Selenium Manager resuelve el driver
     d.set_page_load_timeout(PAGELOAD_TIMEOUT)
     d.implicitly_wait(IMPLICIT_WAIT)
@@ -78,7 +89,7 @@ def build_driver():
 
 def tiny_sleep(): time.sleep(1.2)
 
-# --------- helpers de scraping ----------
+# ---------- helpers scraping ----------
 def _collect_texts(driver, code: str):
     texts = []
     for css in [
@@ -116,18 +127,13 @@ def _infer_status_when_carrier(texts):
             break
     return status or "Sin clasificar", when, carrier
 
-# --------- extractor principal (solo último evento) ----------
+# ---------- extractor principal: último evento ----------
 def fetch_status_mailamericas(driver, code: str):
-    """
-    Lee SOLO el último evento del timeline de MailAmericas:
-    devuelve (status, when, carrier, observation).
-    """
     url = f"https://www.mailamericas.com/tracking?tracking={code}"
     driver.get(url)
     tiny_sleep()
 
     try:
-        # timeline y steps
         timeline = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "div.process-vertical"))
         )
@@ -135,7 +141,6 @@ def fetch_status_mailamericas(driver, code: str):
         if not steps:
             raise RuntimeError("No hay steps .process-step")
 
-        # toma primer step con título
         for step in steps:
             try:
                 left  = step.find_element(By.CSS_SELECTOR, "div.process-step-content div.form-row div.col-md-7")
@@ -149,8 +154,7 @@ def fetch_status_mailamericas(driver, code: str):
                 try:
                     el = left.find_element(By.CSS_SELECTOR, sel)
                     title = (el.text or "").strip()
-                    if title:
-                        break
+                    if title: break
                 except Exception:
                     pass
             if not title:
@@ -171,19 +175,16 @@ def fetch_status_mailamericas(driver, code: str):
                 for el in right.find_elements(By.CSS_SELECTOR, "span, time, p, div"):
                     t = (el.text or "").strip()
                     if len(t) >= 8:
-                        when = t
-                        break
+                        when = t; break
             except Exception:
                 pass
 
-            # carrier/ubicación (etiqueta por defecto)
             carrier = "MailAmericas / Correo destino"
             return title, when, carrier, observation[:900]
 
         raise RuntimeError("No se pudo identificar el bloque de estado")
 
     except Exception:
-        # respaldo genérico si cambió el HTML
         texts = _collect_texts(driver, code)
         if not texts:
             try:
@@ -196,31 +197,29 @@ def fetch_status_mailamericas(driver, code: str):
         status, when, carrier = _infer_status_when_carrier(texts)
         return status, when, carrier, " | ".join(texts)[:900]
 
-# --------- main ----------
+# ---------- main ----------
 def main():
     ws = open_ws()
     rows = ws.get_all_values()  # fila 1 = cabecera
 
     d = build_driver()
     try:
-        for i, row in enumerate(rows[1:], start=2):  # desde fila 2
-            # lee código y control
-            code   = (row[COL_CODE-1]   if len(row) >= COL_CODE   else "").strip()
-            done   = (row[COL_DONE-1]   if len(row) >= COL_DONE   else "").strip().lower()
+        for i, row in enumerate(rows[1:], start=2):
+            code = (row[COL_CODE-1] if len(row) >= COL_CODE else "").strip()
+            done = (row[COL_DONE-1] if len(row) >= COL_DONE else "").strip().lower()
 
-            # omitir si no hay código o si H == "ok"
+            # omitir si no hay código o si marcaste "OK"
             if not code or done == "ok":
                 continue
 
             try:
                 status, when, carrier, obs = fetch_status_mailamericas(d, code)
-                # escribe C..G (status, when, carrier, updated, obs)
+                # escribe C..G
                 ws.update(
                     values=[[status or "", when or "", carrier or "", now_bo(), obs or ""]],
                     range_name=f"{chr(64+COL_STATUS)}{i}:{chr(64+COL_OBS)}{i}"
                 )
             except Exception as e:
-                # si falla, al menos marca la hora y el error en F/G
                 ws.update(
                     values=[[now_bo(), f"Error {type(e).__name__}"]],
                     range_name=f"{chr(64+COL_UPDATED)}{i}:{chr(64+COL_OBS)}{i}"
